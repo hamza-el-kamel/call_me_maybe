@@ -1,5 +1,6 @@
 import json
 import numpy
+from concurrent.futures import ThreadPoolExecutor
 from models import FunctionCalling
 from llm_sdk import Small_LLM_Model
 from tokenizer_map import LoadVocab
@@ -22,12 +23,37 @@ model = Small_LLM_Model()
 path_vocab = model.get_path_to_vocab_file()
 vocab = LoadVocab(path_vocab)
 
+_candidate_cache: dict[tuple[str, str], list[int]] = {}
+
+
+def get_candidate_tokens(
+    slot_label: str,
+    is_allowed_fn: Callable[[str, str], bool],
+    partial: str,
+) -> list[int]:
+    """
+    Return the list of token_ids allowed to follow `partial`.
+    """
+    cache_key = (slot_label, partial)
+    cached = _candidate_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    candidates = [
+        token_id
+        for token_id, token_string in vocab.swaped_data.items()
+        if is_allowed_fn(partial, token_string)
+    ]
+    _candidate_cache[cache_key] = candidates
+    return candidates
+
 
 def generate_constrained(
-        run_token: list[int],
-        is_allowed_fn:  Callable[[str, str], bool],
-        is_complete_fn: Callable[[str], bool],
-        ) -> str:
+    run_token: list[int],
+    slot_label: str,
+    is_allowed_fn: Callable[[str, str], bool],
+    is_complete_fn: Callable[[str], bool],
+) -> str:
     """
     Generate text while allowing only tokens accepted by the grammar.
     """
@@ -38,15 +64,12 @@ def generate_constrained(
 
         next_token_array = numpy.array(next_token)
 
-        for token_id in range(len(next_token_array)):
-            try:
-                token_string = vocab.id_to_token(token_id)
-            except KeyError:
-                next_token_array[token_id] = -numpy.inf
-                continue
+        candidates = get_candidate_tokens(slot_label, is_allowed_fn, partial)
 
-            if not is_allowed_fn(partial, token_string):
-                next_token_array[token_id] = -numpy.inf
+        masked = numpy.full(len(next_token_array), -numpy.inf)
+        for token_id in candidates:
+            masked[token_id] = next_token_array[token_id]
+        next_token_array = masked
 
         next_token_id = numpy.argmax(next_token_array, axis=-1)
 
@@ -76,10 +99,8 @@ def append_fixed_text(run_token: list[int], output: str, text: str) -> str:
 
 
 def generate_parameters_object(
-        run_token: list[int],
-        output: str,
-        param_specs: dict[str, dict[str, str]]
-        ) -> str:
+    run_token: list[int], output: str, param_specs: dict[str, dict[str, str]]
+) -> str:
     """
     param_specs: dict like {"a": {"type": "number"}, "b": {"type": "number"}}
     Builds: {"a": 1, "b": 2}
@@ -103,10 +124,8 @@ def generate_parameters_object(
             return is_value_complete(p, t)
 
         value_partial = generate_constrained(
-            run_token,
-            is_allowed_fn,
-            is_complete_fn
-            )
+            run_token, param_type, is_allowed_fn, is_complete_fn
+        )
         output += value_partial
 
         if i < len(param_names) - 1:
@@ -121,8 +140,7 @@ def user_prompt(text_prompt: str, functions: list[Any]) -> str:
     Build the prompt containing the available functions.
     """
     function_name = [
-        f'"{function.name}": "{function.description}".\n'
-        for function in functions
+        f'"{function.name}": "{function.description}".\n' for function in functions
     ]
     function_name_text = "\n".join(function_name)
     text = "You are choosing which function to call for a user's request.\n"
@@ -162,10 +180,10 @@ def generate_function_call(text: str, functions: list[Any]) -> str:
                 names: list[str] = allowed_names,
             ) -> bool:
                 return is_function_name_complete(p, names)
+
             chosen_quoted_name = generate_constrained(
-                run_token,
-                is_allowed_fn,
-                is_complete_fn)
+                run_token, "function_name", is_allowed_fn, is_complete_fn
+            )
             output += chosen_quoted_name
 
             chosen_name = chosen_quoted_name.strip('"')
@@ -180,10 +198,7 @@ def generate_function_call(text: str, functions: list[Any]) -> str:
     return output
 
 
-def single_prompt(
-        text: str,
-        functions: list[Any]
-        ) -> Optional[FunctionCalling]:
+def single_prompt(text: str, functions: list[Any]) -> Optional[FunctionCalling]:
     """
     Generate and validate a function call for one prompt
     """
@@ -202,11 +217,29 @@ def single_prompt(
         return None
 
 
+def process_batch(
+    prompts: list[Any],
+    functions: list[Any],
+    max_workers: int = 2,
+) -> list[Optional[FunctionCalling]]:
+    """
+    Process prompts CONCURRENTLY using threads..
+    """
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(
+            executor.map(
+                lambda prom: single_prompt(prom.prompt, functions),
+                prompts,
+            )
+        )
+    return results
+
+
 def process_all_prompts(
-        path_result: str = "data/output/function_calling_results.json",
-        path_definition: str = "data/input/functions_definition.json",
-        path_calling: str = "data/input/function_calling_tests.json"
-        ) -> None:
+    path_result: str = "data/output/function_calling_results.json",
+    path_definition: str = "data/input/functions_definition.json",
+    path_calling: str = "data/input/function_calling_tests.json",
+) -> None:
     """
     Process all prompts and save the generated function calls.
     """
@@ -215,17 +248,10 @@ def process_all_prompts(
         print("No functions were loaded. Cannot process prompts.")
         return
     prompts = function_calling(path_calling)
-    results = []
 
-    for prom in prompts:
-        res = single_prompt(prom.prompt, functions)
-        results.append(res)
+    results = process_batch(prompts, functions)
 
-    list_of_dicts = [
-        res.model_dump()
-        for res in results
-        if res
-    ]
+    list_of_dicts = [res.model_dump() for res in results if res]
 
     try:
         with open(path_result, "w") as file:

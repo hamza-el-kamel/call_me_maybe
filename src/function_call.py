@@ -6,6 +6,7 @@ from llm_sdk import Small_LLM_Model
 from tokenizer_map import LoadVocab
 from pydantic import ValidationError
 from typing import Any, Callable, Optional
+import os
 
 from constrained_decoder import (
     build_grammar,
@@ -19,7 +20,7 @@ from constrained_decoder import (
 
 from load_file import functions_definition, function_calling
 
-model = Small_LLM_Model()
+model = Small_LLM_Model(model_name=os.environ.get("LLM_MODEL_NAME", "Qwen/Qwen3-0.6B"))
 path_vocab = model.get_path_to_vocab_file()
 vocab = LoadVocab(path_vocab)
 
